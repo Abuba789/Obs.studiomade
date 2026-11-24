@@ -59,6 +59,17 @@ include(cmake/ui-utility.cmake)
 include(cmake/ui-widgets.cmake)
 include(cmake/ui-wizards.cmake)
 
+target_sources(
+  obs-studio
+  PRIVATE
+    video-editor/EditorPreview.cpp
+    video-editor/EditorPreview.hpp
+    video-editor/EditorProject.cpp
+    video-editor/EditorProject.hpp
+    video-editor/EditorWindow.cpp
+    video-editor/EditorWindow.hpp
+)
+
 if(NOT OAUTH_BASE_URL)
   set(OAUTH_BASE_URL "https://auth.obsproject.com/" CACHE STRING "Default OAuth base URL")
   mark_as_advanced(OAUTH_BASE_URL)

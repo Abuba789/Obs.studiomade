@@ -45,6 +45,7 @@
 #if defined(_WIN32) || defined(WHATSNEW_ENABLED)
 #include <utility/WhatsNewInfoThread.hpp>
 #endif
+#include <video-editor/EditorWindow.hpp>
 #include <widgets/AudioMixer.hpp>
 #include <widgets/OBSProjector.hpp>
 
@@ -137,6 +138,18 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	api = InitializeAPIInterface(this);
 
 	ui->setupUi(this);
+	ui->menuTools->setEnabled(true);
+	auto *editorAction = ui->menuTools->addAction(QTStr("VideoEditor.Menu"));
+	connect(editorAction, &QAction::triggered, this, [this] {
+		if (!videoEditor)
+			videoEditor = new EditorWindow(this);
+		if (videoEditor->isMinimized())
+			videoEditor->showNormal();
+		else
+			videoEditor->show();
+		videoEditor->raise();
+		videoEditor->activateWindow();
+	});
 	ui->previewDisabledWidget->setVisible(false);
 
 	/* Set up streaming connections */
@@ -1327,6 +1340,8 @@ void OBSBasic::applicationShutdown() noexcept
 	delete advAudioWindow;
 	delete about;
 	delete remux;
+	delete videoEditor;
+	videoEditor = nullptr;
 
 	obs_display_remove_draw_callback(ui->preview->GetDisplay(), OBSBasic::RenderMain, this);
 
@@ -1588,6 +1603,12 @@ void OBSBasic::closeEvent(QCloseEvent *event)
 		event->ignore();
 		restart = false;
 
+		return;
+	}
+
+	if (videoEditor && !videoEditor->ConfirmProjectClose()) {
+		event->ignore();
+		restart = false;
 		return;
 	}
 
