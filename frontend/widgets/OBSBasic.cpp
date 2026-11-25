@@ -59,7 +59,9 @@
 #include <qt-wrappers.hpp>
 
 #include <QActionGroup>
+#include <QTabWidget>
 #include <QThread>
+#include <QVBoxLayout>
 #include <QWidgetAction>
 
 #include <mutex>
@@ -138,18 +140,29 @@ OBSBasic::OBSBasic(QWidget *parent) : OBSMainWindow(parent), undo_s(ui), ui(new 
 	api = InitializeAPIInterface(this);
 
 	ui->setupUi(this);
+	auto *workspaceTabs = new QTabWidget(this);
+	workspaceTabs->setDocumentMode(true);
+	workspaceTabs->addTab(takeCentralWidget(), QTStr("VideoEditor.OBSWorkspace"));
+	auto *editorPage = new QWidget(workspaceTabs);
+	auto *editorLayout = new QVBoxLayout(editorPage);
+	editorLayout->setContentsMargins(0, 0, 0, 0);
+	workspaceTabs->addTab(editorPage, QTStr("VideoEditor.EditWorkspace"));
+	setCentralWidget(workspaceTabs);
+	connect(workspaceTabs, &QTabWidget::currentChanged, this, [this, editorPage, editorLayout, workspaceTabs] {
+		const bool editing = workspaceTabs->currentWidget() == editorPage;
+		const bool showPreview = !editing && (previewEnabled || IsPreviewProgramMode()) && !isMinimized();
+		obs_display_set_enabled(ui->preview->GetDisplay(), showPreview);
+		if (program)
+			obs_display_set_enabled(program->GetDisplay(), !editing);
+		if (editing && !videoEditor) {
+			videoEditor = new EditorWindow(editorPage);
+			editorLayout->addWidget(videoEditor);
+		}
+	});
 	ui->menuTools->setEnabled(true);
 	auto *editorAction = ui->menuTools->addAction(QTStr("VideoEditor.Menu"));
-	connect(editorAction, &QAction::triggered, this, [this] {
-		if (!videoEditor)
-			videoEditor = new EditorWindow(this);
-		if (videoEditor->isMinimized())
-			videoEditor->showNormal();
-		else
-			videoEditor->show();
-		videoEditor->raise();
-		videoEditor->activateWindow();
-	});
+	connect(editorAction, &QAction::triggered, this,
+		[workspaceTabs, editorPage] { workspaceTabs->setCurrentWidget(editorPage); });
 	ui->previewDisabledWidget->setVisible(false);
 
 	/* Set up streaming connections */

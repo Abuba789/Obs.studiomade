@@ -68,6 +68,9 @@ target_sources(
     video-editor/EditorProject.hpp
     video-editor/EditorWindow.cpp
     video-editor/EditorWindow.hpp
+    video-editor/EditorSubtitles.cpp
+    video-editor/SpeechRecognition.cpp
+    video-editor/SpeechRecognition.hpp
 )
 
 if(NOT OAUTH_BASE_URL)

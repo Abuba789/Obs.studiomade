@@ -34,6 +34,48 @@ If the number remaining is above 0, there are memory leaks.
 
 See :ref:`obs_init_shutdown_reference` for more information.
 
+Video Editor
+------------
+
+The editor opens in the Editing tab of the main window, also reachable from
+the Tools menu. The media library accepts local files from its import button
+or by drag and drop.
+The editor keeps its project separate from the scene collection. It uses the
+existing FFmpeg libraries to probe local media and creates a private instance
+of the Media Source plugin for preview. The preview uses the rendering display
+API and audio monitoring, with its output mixers disabled. Switching back
+to the OBS tab releases the editor preview source.
+
+The project stores media references and one video and one audio track. Each
+clip has a timeline start and a half-open range in the source media, measured
+in milliseconds. Trimming keeps the timeline start fixed. Splitting creates
+two adjacent clips and leaves the other clips in place. The project reader
+opens version 1 and 2 files and writes version 3 files. Subtitles are stored
+with their clip in source-media time. Trim hides portions outside the visible
+range, moving a clip translates the cues on the timeline, and splitting
+clamps crossing cues to each resulting side. SRT export uses timeline time.
+
+To generate subtitles, select a clip and open Generate Subtitles Automatically.
+Select local FFmpeg and whisper-cli executables and a compatible Whisper model
+file. Multilingual models support Portuguese, English, Spanish and automatic
+language detection. The GPU is available with compatible whisper.cpp builds.
+Use the CPU option for a CPU-only run.
+
+The editor invokes standalone executables through QProcess. It extracts the
+first audio track as 16 kHz mono PCM in a temporary directory, then passes it
+to whisper-cli in chunks up to ten minutes. This bounds the PCM memory needed
+by the recognizer. Segment offsets map back to source-media time. Compatible
+token offsets are grouped into words when the tokens match the cue text and
+the word has a valid interval. Editing one word preserves this alignment,
+and rewriting the entire text clears it. Existing cues take precedence when
+generating again.
+
+No model or new executable is bundled by this integration. The upstream
+`whisper.cpp code <https://github.com/ggml-org/whisper.cpp/blob/master/LICENSE>`__
+and `OpenAI Whisper code and weights <https://github.com/openai/whisper#license>`__
+use the MIT license. FFmpeg is LGPL 2.1 or later by default and its
+`options can change its distribution terms <https://ffmpeg.org/legal.html>`__.
+
 
 Reconfiguring Video
 -------------------

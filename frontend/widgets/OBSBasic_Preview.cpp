@@ -265,7 +265,7 @@ void OBSBasic::on_previewDisabledWidget_customContextMenuRequested()
 
 void OBSBasic::EnablePreviewDisplay(bool enable)
 {
-	obs_display_set_enabled(ui->preview->GetDisplay(), enable);
+	obs_display_set_enabled(ui->preview->GetDisplay(), enable && ui->centralwidget->isVisible());
 	ui->previewContainer->setVisible(enable);
 	ui->previewDisabledWidget->setVisible(!enable);
 }
