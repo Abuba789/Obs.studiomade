@@ -55,7 +55,8 @@ private:
 	int playheadSource = 0;
 	QGraphicsLineItem *playhead = nullptr;
 	QUndoStack *subtitleUndo;
-	QAction *generate;
+	QPushButton *generate;
+	QPushButton *enhance;
 	QAction *addSubtitle;
 	QAction *pasteSubtitle;
 	QList<QAction *> cueActions;
@@ -82,6 +83,7 @@ private:
 	void AdjustSubtitleJob(int clip, int delta);
 	void EditSubtitle(bool add);
 	void EditSubtitleWord();
+	void EditSubtitleStyle();
 	void SplitSubtitle();
 	void MergeSubtitle();
 	void CopySubtitle();
@@ -89,5 +91,7 @@ private:
 	void ChangeSubtitles(int clip, QVector<VideoEditor::Subtitle> subtitles, int selection);
 	void DragSubtitle(int clip, int cue, int mode, int delta);
 	void ExportSubtitles();
+	void ExportCaptionVideo();
+	void EnhanceVideo();
 	QString Text(const char *key) const;
 };

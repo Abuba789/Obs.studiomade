@@ -2,7 +2,8 @@
 
 #include <utility/display-helpers.hpp>
 
-#include <QPainter>
+
+#include <QStringList>
 
 #include <algorithm>
 
@@ -60,9 +61,14 @@ void EditorPreview::Clear()
 	Attach();
 }
 
-bool EditorPreview::Play(const QString &path, int timeMs)
+bool EditorPreview::Play(const QString &path, int timeMs, bool paused)
 {
 	if (source && path == currentPath) {
+		if (paused && !Ended()) {
+			Pause();
+			Seek(timeMs);
+			return true;
+		}
 		if (obs_source_media_get_state(source) == OBS_MEDIA_STATE_PAUSED) {
 			obs_source_media_play_pause(source, false);
 			return true;
@@ -89,6 +95,8 @@ bool EditorPreview::Play(const QString &path, int timeMs)
 	obs_source_inc_showing(source);
 	Attach();
 	obs_source_media_restart(source);
+	if (paused)
+		Pause();
 	Seek(timeMs);
 	obs_source_set_monitoring_enabled(source, true);
 	return true;
@@ -103,6 +111,12 @@ void EditorPreview::Pause()
 bool EditorPreview::Playing() const
 {
 	return source && obs_source_media_get_state(source) == OBS_MEDIA_STATE_PLAYING;
+}
+
+bool EditorPreview::Ended() const
+{
+	const auto state = source ? obs_source_media_get_state(source) : OBS_MEDIA_STATE_STOPPED;
+	return state == OBS_MEDIA_STATE_ENDED || state == OBS_MEDIA_STATE_ERROR || state == OBS_MEDIA_STATE_STOPPED;
 }
 
 int EditorPreview::Time() const
@@ -143,29 +157,16 @@ void EditorPreview::Render(void *data, uint32_t width, uint32_t height)
 	gs_viewport_pop();
 }
 
-void EditorPreview::SetSubtitle(const QString &text)
+void EditorPreview::SetSubtitles(const QVector<VideoEditor::Caption> &captions)
 {
-	if (text == subtitleText)
+	if (captions == subtitleCaptions)
 		return;
-	subtitleText = text;
-	setAccessibleDescription(text);
-	QImage image;
-	if (!text.isEmpty()) {
-		image = QImage(640, 360, QImage::Format_RGBA8888);
-		image.fill(Qt::transparent);
-		QPainter painter(&image);
-		painter.setRenderHint(QPainter::TextAntialiasing);
-		QFont font = painter.font();
-		font.setPixelSize(23);
-		font.setBold(true);
-		painter.setFont(font);
-		const int flags = Qt::AlignHCenter | Qt::TextWordWrap;
-		auto bounds = painter.boundingRect(QRect(0, 0, 568, 310), flags, text);
-		bounds.moveCenter(QPoint(320, 332 - bounds.height() / 2));
-		painter.fillRect(bounds.adjusted(-10, -5, 10, 5), QColor(0, 0, 0, 180));
-		painter.setPen(Qt::white);
-		painter.drawText(bounds, flags, text);
-	}
+	subtitleCaptions = captions;
+	QStringList accessible;
+	for (const auto &caption : captions)
+		accessible.append(caption.text);
+	auto image = VideoEditor::RenderSubtitles(captions);
+	setAccessibleDescription(accessible.join(u'\n'));
 	QMutexLocker lock(&subtitleMutex);
 	subtitleImage = std::move(image);
 }

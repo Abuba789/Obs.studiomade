@@ -29,6 +29,8 @@ static bool ValidSubtitles(const Clip &clip, const Asset &asset)
 		if (cue.inMs < 0 || cue.outMs <= cue.inMs || cue.outMs > asset.durationMs || cue.text.trimmed().isEmpty())
 			return false;
 		for (const auto &word : cue.words) {
+			if (word.inMs == 0 && word.outMs == 0)
+				continue;
 			if (word.inMs < 0 || word.outMs <= word.inMs || word.outMs > asset.durationMs)
 				return false;
 		}
@@ -38,6 +40,8 @@ static bool ValidSubtitles(const Clip &clip, const Asset &asset)
 
 bool Project::SetSubtitles(int clip, QVector<Subtitle> subtitles)
 {
+	if (clip < 0 || clip >= clips.size())
+		return false;
 	auto updated = clips[clip];
 	updated.subtitles = std::move(subtitles);
 	if (!ValidSubtitles(updated, assets[updated.asset]))
@@ -83,6 +87,42 @@ bool Project::Import(const QString &path)
 		return false;
 
 	assets.append({localPath, static_cast<int>(duration), hasVideo ? Track::Video : Track::Audio});
+	return true;
+}
+
+bool Project::AddEnhancedVersion(const QString &path, int clip, int sourceStart, bool replace)
+{
+	if (clip < 0 || clip >= clips.size() || sourceStart < 0 || sourceStart > clips[clip].inMs)
+		return false;
+	Project updated = *this;
+	if (!updated.Import(path) || updated.assets.size() != assets.size() + 1 ||
+	    updated.assets.back().track != Track::Video)
+		return false;
+	updated.assets.back().enhanced = true;
+	if (replace) {
+		auto &replacement = updated.clips[clip];
+		replacement.asset = static_cast<int>(updated.assets.size()) - 1;
+		replacement.inMs -= sourceStart;
+		replacement.outMs = std::min(replacement.outMs - sourceStart, updated.assets.back().durationMs);
+		replacement.subtitles.removeIf([&](const Subtitle &cue) {
+			return cue.outMs - sourceStart <= replacement.inMs || cue.inMs - sourceStart >= replacement.outMs;
+		});
+		for (auto &cue : replacement.subtitles) {
+			cue.inMs = std::max(0, cue.inMs - sourceStart);
+			cue.outMs = std::min(updated.assets.back().durationMs, cue.outMs - sourceStart);
+			for (auto &word : cue.words) {
+				if (!word.Known())
+					continue;
+				word.inMs = std::max(0, word.inMs - sourceStart);
+				word.outMs = std::min(updated.assets.back().durationMs, word.outMs - sourceStart);
+				if (!word.Known())
+					word = {0, 0};
+			}
+		}
+		if (!updated.CanPlace(replacement, clip) || !ValidSubtitles(replacement, updated.assets.back()))
+			return false;
+	}
+	*this = std::move(updated);
 	return true;
 }
 
@@ -178,7 +218,8 @@ QJsonObject Project::Serialize(const QString &directory) const
 	for (const auto &asset : assets) {
 		media.append(QJsonObject{{"path"_L1, base.relativeFilePath(asset.path)},
 					 {"durationMs"_L1, asset.durationMs},
-					 {"track"_L1, asset.track == Track::Video ? "video"_L1 : "audio"_L1}});
+					 {"track"_L1, asset.track == Track::Video ? "video"_L1 : "audio"_L1},
+					 {"enhanced"_L1, asset.enhanced}});
 	}
 	for (const auto &clip : clips) {
 		QJsonArray subtitles;
@@ -187,7 +228,8 @@ QJsonObject Project::Serialize(const QString &directory) const
 			for (const auto &word : cue.words)
 				words.append(QJsonArray{word.inMs, word.outMs});
 			subtitles.append(QJsonObject{{"inMs"_L1, cue.inMs}, {"outMs"_L1, cue.outMs},
-						     {"text"_L1, cue.text}, {"language"_L1, cue.language}, {"words"_L1, words}});
+						     {"text"_L1, cue.text}, {"language"_L1, cue.language}, {"words"_L1, words},
+						     {"style"_L1, cue.style}});
 		}
 		timeline.append(QJsonObject{{"asset"_L1, clip.asset},
 					    {"startMs"_L1, clip.startMs},
@@ -195,7 +237,7 @@ QJsonObject Project::Serialize(const QString &directory) const
 					    {"outMs"_L1, clip.outMs},
 					    {"subtitles"_L1, subtitles}});
 	}
-	return {{"version"_L1, 3}, {"media"_L1, media}, {"clips"_L1, timeline}};
+	return {{"version"_L1, 4}, {"media"_L1, media}, {"clips"_L1, timeline}};
 }
 
 bool Project::Save(const QString &path) const
@@ -212,7 +254,7 @@ bool Project::Open(const QString &path)
 		return false;
 	const QJsonObject json = QJsonDocument::fromJson(file.readAll()).object();
 	const int version = json["version"_L1].toInt();
-	if (version < 1 || version > 3 || !json["media"_L1].isArray() || !json["clips"_L1].isArray())
+	if (version < 1 || version > 4 || !json["media"_L1].isArray() || !json["clips"_L1].isArray())
 		return false;
 
 	Project loaded;
@@ -225,7 +267,7 @@ bool Project::Open(const QString &path)
 		if (mediaPath.isEmpty() || duration <= 0 || (track != "video"_L1 && track != "audio"_L1))
 			return false;
 		loaded.assets.append({QDir::cleanPath(base.absoluteFilePath(mediaPath)), duration,
-				      track == "video"_L1 ? Track::Video : Track::Audio});
+				      track == "video"_L1 ? Track::Video : Track::Audio, item["enhanced"_L1].toBool()});
 	}
 	for (const auto &entry : json["clips"_L1].toArray()) {
 		const auto item = entry.toObject();
@@ -238,7 +280,7 @@ bool Project::Open(const QString &path)
 		for (const auto &subtitle : item["subtitles"_L1].toArray()) {
 			const auto cue = subtitle.toObject();
 			Subtitle value{cue["inMs"_L1].toInt(-1), cue["outMs"_L1].toInt(-1), cue["text"_L1].toString(),
-				       cue["language"_L1].toString(), {}};
+				       cue["language"_L1].toString(), {}, cue["style"_L1].toObject()};
 			for (const auto &timing : cue["words"_L1].toArray()) {
 				const auto word = timing.toArray();
 				if (word.size() != 2)
@@ -253,41 +295,6 @@ bool Project::Open(const QString &path)
 	}
 	*this = std::move(loaded);
 	return true;
-}
-
-bool Project::ExportSrt(const QString &path) const
-{
-	QVector<Subtitle> visible;
-	for (const auto &clip : clips) {
-		for (auto cue : clip.subtitles) {
-			const int start = std::max(cue.inMs, clip.inMs);
-			const int end = std::min(cue.outMs, clip.outMs);
-			if (start >= end)
-				continue;
-			cue.inMs = clip.startMs + (start - clip.inMs);
-			cue.outMs = clip.startMs + (end - clip.inMs);
-			visible.append(std::move(cue));
-		}
-	}
-	std::stable_sort(visible.begin(), visible.end(), [](const Subtitle &a, const Subtitle &b) {
-		return a.inMs < b.inMs;
-	});
-	const auto timestamp = [](int ms) {
-		return QStringLiteral("%1:%2:%3,%4")
-			.arg(ms / 3600000, 2, 10, QLatin1Char('0')).arg(ms / 60000 % 60, 2, 10, QLatin1Char('0'))
-			.arg(ms / 1000 % 60, 2, 10, QLatin1Char('0')).arg(ms % 1000, 3, 10, QLatin1Char('0'));
-	};
-	QSaveFile file(path);
-	if (visible.isEmpty() || !file.open(QIODevice::WriteOnly))
-		return false;
-	for (qsizetype i = 0; i < visible.size(); ++i) {
-		const auto &cue = visible[i];
-		const auto data = QStringLiteral("%1\n%2 --> %3\n%4\n\n").arg(i + 1)
-					  .arg(timestamp(cue.inMs), timestamp(cue.outMs), cue.text.simplified()).toUtf8();
-		if (file.write(data) != data.size())
-			return false;
-	}
-	return file.commit();
 }
 
 bool Project::Export(const QString &directory) const

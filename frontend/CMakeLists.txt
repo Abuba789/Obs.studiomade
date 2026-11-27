@@ -68,7 +68,11 @@ target_sources(
     video-editor/EditorProject.hpp
     video-editor/EditorWindow.cpp
     video-editor/EditorWindow.hpp
+    video-editor/VideoEnhancer.cpp
     video-editor/EditorSubtitles.cpp
+    video-editor/SubtitleExporter.cpp
+    video-editor/SubtitleRenderer.cpp
+    video-editor/SubtitleRenderer.hpp
     video-editor/SpeechRecognition.cpp
     video-editor/SpeechRecognition.hpp
 )

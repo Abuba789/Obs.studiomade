@@ -77,6 +77,7 @@ EditorWindow::EditorWindow(QWidget *parent) : QMainWindow(parent)
 	auto *previewPanel = new QGroupBox(Text("Preview"), panes);
 	auto *previewLayout = new QVBoxLayout(previewPanel);
 	preview = new EditorPreview(previewPanel);
+	preview->setAccessibleName(Text("SubtitlePreview"));
 	play = new QPushButton(Text("Play"), previewPanel);
 	seek = new QSlider(Qt::Horizontal, previewPanel);
 	seek->setAccessibleName(Text("Seek"));
@@ -113,7 +114,13 @@ EditorWindow::EditorWindow(QWidget *parent) : QMainWindow(parent)
 	}
 	trim = new QPushButton(Text("Trim"), properties);
 	split = new QPushButton(Text("Split"), properties);
+	generate = new QPushButton(Text("GenerateSubtitles"), properties);
+	enhance = new QPushButton(Text("Enhancer"), properties);
 	form->addRow(details);
+	form->addRow(generate);
+	form->addRow(enhance);
+	connect(generate, &QPushButton::clicked, this, &EditorWindow::GenerateSubtitles);
+	connect(enhance, &QPushButton::clicked, this, &EditorWindow::EnhanceVideo);
 	form->addRow(Text("StartSeconds"), startTime);
 	form->addRow(move);
 	form->addRow(Text("InSeconds"), inTime);
@@ -178,7 +185,14 @@ EditorWindow::EditorWindow(QWidget *parent) : QMainWindow(parent)
 		selectedCue = item && item->data(1).isValid() ? item->data(1).toInt() : -1;
 		if (selectedCue >= 0) {
 			const auto &segment = project.Clips()[clip];
-			seek->setValue(std::max(0, segment.subtitles[selectedCue].inMs - segment.inMs));
+			const int offset = std::max(0, segment.subtitles[selectedCue].inMs - segment.inMs);
+			const auto &asset = project.Assets()[segment.asset];
+			if (QFileInfo(asset.path).isFile())
+				preview->Play(asset.path, segment.inMs + offset, true);
+			previewTimer->stop();
+			play->setText(Text("Play"));
+			seek->setValue(offset);
+			UpdateSubtitlePreview(segment.inMs + offset);
 		}
 		UpdateSubtitleActions();
 	});
@@ -302,7 +316,8 @@ void EditorWindow::UpdateLibrary()
 {
 	library->clear();
 	for (const auto &asset : project.Assets()) {
-		auto *item = new QListWidgetItem(QFileInfo(asset.path).fileName(), library);
+		const auto name = QFileInfo(asset.path).fileName();
+		auto *item = new QListWidgetItem(asset.enhanced ? Text("EnhancerMarked").arg(name) : name, library);
 		item->setToolTip(QDir::toNativeSeparators(asset.path));
 	}
 }
@@ -335,7 +350,8 @@ void EditorWindow::UpdateTimeline()
 	for (qsizetype i = 0; i < project.Clips().size(); ++i) {
 		const auto &clip = project.Clips()[i];
 		const auto &asset = project.Assets()[clip.asset];
-		const auto name = QFileInfo(asset.path).fileName();
+		const auto filename = QFileInfo(asset.path).fileName();
+		const auto name = asset.enhanced ? Text("EnhancerMarked").arg(filename) : filename;
 		const int y = asset.track == Track::Video ? 28 : 72;
 		auto *block = timeline->addRect(0, 0, std::max(2.0, clip.Duration() * scale), 32,
 						QPen(palette().mid(), 1), palette().highlight());
@@ -367,6 +383,7 @@ void EditorWindow::SelectClip(int clip)
 	seek->setValue(0);
 	play->setText(Text("Play"));
 	const bool selected = clip >= 0;
+	enhance->setEnabled(selected && project.Assets()[project.Clips()[clip].asset].track == Track::Video);
 	seek->setEnabled(selected);
 	play->setEnabled(selected);
 	move->setEnabled(selected);
@@ -404,18 +421,23 @@ void EditorWindow::UpdatePreviewPosition()
 		return;
 	const auto &clip = project.Clips()[selectedClip];
 	const int sourceTime = preview->Time();
-	UpdateSubtitlePreview(sourceTime);
-	if (sourceTime >= clip.outMs) {
+	if (sourceTime >= clip.outMs || preview->Ended()) {
 		preview->Clear();
-		if (!seek->isSliderDown())
+		if (!seek->isSliderDown()) {
+			const QSignalBlocker blocker(seek);
 			seek->setValue(0);
-	} else if (preview->Playing() && sourceTime >= clip.inMs && !seek->isSliderDown()) {
+		}
+		UpdateSubtitlePreview(clip.outMs);
+	} else {
+		UpdateSubtitlePreview(sourceTime);
+	}
+	if (preview->Playing() && sourceTime >= clip.inMs && !seek->isSliderDown()) {
 		const QSignalBlocker blocker(seek);
 		seek->setValue(sourceTime - clip.inMs);
 	}
 	const bool playing = preview->Playing();
 	play->setText(Text(playing ? "Pause" : "Play"));
-	if (!playing)
+	if (!playing && preview->Ended())
 		previewTimer->stop();
 }
 
@@ -424,6 +446,7 @@ void EditorWindow::Play()
 	if (preview->Playing()) {
 		preview->Pause();
 		UpdatePreviewPosition();
+		previewTimer->stop();
 		return;
 	}
 	const auto &clip = project.Clips()[selectedClip];
@@ -433,7 +456,6 @@ void EditorWindow::Play()
 		return;
 	}
 	previewTimer->start();
-	UpdatePreviewPosition();
 	statusBar()->clearMessage();
 }
 

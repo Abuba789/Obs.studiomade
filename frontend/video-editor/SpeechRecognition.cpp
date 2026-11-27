@@ -61,7 +61,7 @@ void SpeechRecognition::Extract()
 	chunkEnd = cursor + std::min(600000, end - cursor);
 	progress(static_cast<int>(100LL * (cursor - start) / (end - start)), false);
 	process.start(options.ffmpeg,
-		      {u"-nostdin"_s, u"-hide_banner"_s, u"-loglevel"_s, u"error"_s, u"-y"_s,
+		      {u"-nostdin"_s, u"-hide_banner"_s, u"-loglevel"_s, u"error"_s, u"-progress"_s, u"pipe:2"_s, u"-y"_s,
 		       u"-protocol_whitelist"_s, u"file"_s, u"-ss"_s, QString::number(cursor / 1000.0, 'f', 3),
 		       u"-i"_s, media, u"-t"_s, QString::number((chunkEnd - cursor) / 1000.0, 'f', 3),
 		       u"-map"_s, u"0:a:0"_s, u"-af"_s, u"aresample=async=1:first_pts=0"_s,
@@ -74,7 +74,7 @@ void SpeechRecognition::Recognize()
 	recognizing = true;
 	log.clear();
 	QFile::remove(temporary.filePath(u"captions.json"_s));
-	progress(static_cast<int>(100LL * (cursor - start) / (end - start)), true);
+	progress(static_cast<int>((100LL * (cursor - start) + 10LL * (chunkEnd - cursor)) / (end - start)), true);
 	QStringList args{u"-m"_s, options.model, u"-f"_s, temporary.filePath(u"audio.wav"_s),
 			 u"-l"_s, options.language, u"-ojf"_s, u"-of"_s, temporary.filePath(u"captions"_s),
 			 u"-pp"_s, u"-ml"_s, u"84"_s, u"-sow"_s, u"-t"_s,
@@ -87,16 +87,18 @@ void SpeechRecognition::Recognize()
 void SpeechRecognition::ReadProgress()
 {
 	log = (log + process.readAllStandardError()).right(8192);
-	if (!recognizing)
-		return;
 	static const QRegularExpression pattern(u"progress\\s*=\\s*(\\d+)%"_s);
-	auto matches = pattern.globalMatch(QString::fromUtf8(log));
-	int percent = 0;
+	static const QRegularExpression extraction(u"out_time_us=(\\d+)"_s);
+	auto matches = (recognizing ? pattern : extraction).globalMatch(QString::fromUtf8(log));
+	qint64 value = 0;
 	while (matches.hasNext())
-		percent = matches.next().captured(1).toInt();
-	if (percent > 0) {
-		const qint64 done = 100LL * (cursor - start) + std::clamp(percent, 0, 100) * qint64(chunkEnd - cursor);
-		progress(std::min(99, static_cast<int>(done / (end - start))), true);
+		value = matches.next().captured(1).toLongLong();
+	if (value > 0) {
+		const qint64 length = chunkEnd - cursor;
+		const qint64 chunkProgress = recognizing ? (10 + std::clamp<qint64>(value, 0, 100) * 9 / 10) * length
+							  : std::min(length, value / 1000) * 10;
+		const qint64 done = 100LL * (cursor - start) + chunkProgress;
+		progress(std::min(99, static_cast<int>(done / (end - start))), recognizing);
 	}
 }
 
@@ -148,6 +150,7 @@ bool SpeechRecognition::ReadResult()
 			qsizetype to;
 			int start;
 			int end;
+			bool lexical;
 		};
 		QVector<Token> tokens;
 		for (const auto &entry : data["tokens"_L1].toArray()) {
@@ -158,7 +161,8 @@ bool SpeechRecognition::ReadResult()
 			const auto times = token["offsets"_L1].toObject();
 			const auto from = tokenText.size();
 			tokenText += text;
-			tokens.append({from, tokenText.size(), position(times["from"_L1]), position(times["to"_L1])});
+			tokens.append({from, tokenText.size(), position(times["from"_L1]), position(times["to"_L1]),
+				       std::any_of(text.begin(), text.end(), [](QChar c) { return c.isLetterOrNumber(); })});
 		}
 		if (tokenText.simplified() == cue.text) {
 			static const QRegularExpression word(u"\\S+"_s);
@@ -168,17 +172,15 @@ bool SpeechRecognition::ReadResult()
 				VideoEditor::SubtitleTiming timing{cue.outMs, cue.inMs};
 				for (const auto &token : tokens) {
 					if (token.from < match.capturedEnd() && token.to > match.capturedStart() &&
-					    token.end > token.start) {
+					    token.end > token.start && token.lexical) {
 						timing.inMs = std::min(timing.inMs, std::max(token.start, cue.inMs));
 						timing.outMs = std::max(timing.outMs, std::min(token.end, cue.outMs));
 					}
 				}
-				if (timing.outMs <= timing.inMs) {
-					cue.words.clear();
-					break;
-				}
-				cue.words.append(timing);
+				cue.words.append(timing.Known() ? timing : VideoEditor::SubtitleTiming{0, 0});
 			}
+			if (std::none_of(cue.words.begin(), cue.words.end(), [](const auto &timing) { return timing.Known(); }))
+				cue.words.clear();
 		}
 		subtitles.append(std::move(cue));
 	}

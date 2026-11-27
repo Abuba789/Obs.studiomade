@@ -1,41 +1,76 @@
 #include "EditorWindow.hpp"
 #include "EditorPreview.hpp"
 
+#include <OBSApp.hpp>
+
 #include <QAction>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontComboBox>
 #include <QFormLayout>
 #include <QGraphicsItem>
 #include <QGraphicsScene>
 #include <QGraphicsSceneMouseEvent>
 #include <QInputDialog>
+#include <QJsonDocument>
+#include <QMap>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QMenu>
 #include <QProgressDialog>
+#include <QScrollArea>
+#include <QSettings>
 #include <QPushButton>
+#include <QSpinBox>
 #include <QSlider>
+#include <QTemporaryDir>
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QTimer>
 #include <QToolBar>
 #include <QUndoStack>
+#include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <utility>
 
 using namespace Qt::StringLiterals;
 using VideoEditor::Subtitle;
 
 namespace {
+VideoEditor::Caption CaptionAt(const Subtitle &cue, int time, int start, int end)
+{
+	VideoEditor::Caption caption{cue.text, cue.style, -1, 100, 0};
+	if (cue.style["highlight"_L1].toBool()) {
+		for (qsizetype i = 0; i < cue.words.size(); ++i) {
+			const auto &word = cue.words[i];
+			if (word.inMs <= time && time < word.outMs) {
+				caption.word = static_cast<int>(i);
+				break;
+			}
+		}
+	}
+	const auto strength = [](int elapsed, int duration) {
+		return duration > 0 ? static_cast<int>(100LL * std::clamp(elapsed, 0, duration) / duration) : 100;
+	};
+	const int half = (end - start) / 2;
+	caption.opacity = std::min(strength(time - start, std::min(half, cue.style["fadeIn"_L1].toInt())),
+				   strength(end - time, std::min(half, cue.style["fadeOut"_L1].toInt())));
+	if (cue.style["slide"_L1].toBool())
+		caption.offset = (100 - strength(time - start, std::min(200, end - start))) / 5;
+	return caption;
+}
+
 class SubtitleChange : public QUndoCommand {
 	std::function<void(const QVector<Subtitle> &, int)> apply;
 	QVector<Subtitle> before;
@@ -59,13 +94,15 @@ public:
 
 class SubtitleBlock : public QGraphicsRectItem {
 	std::function<void(int, double)> change;
+	std::function<void()> edit;
 	double start = 0;
 	QRectF initialRect;
 	QPointF initialPosition;
 	int mode = 0;
 
 public:
-	explicit SubtitleBlock(std::function<void(int, double)> change) : change(std::move(change))
+	SubtitleBlock(std::function<void(int, double)> change, std::function<void()> edit)
+		: change(std::move(change)), edit(std::move(edit))
 	{
 		setFlag(ItemIsSelectable);
 		setFlag(ItemClipsChildrenToShape);
@@ -73,6 +110,12 @@ public:
 	}
 
 protected:
+	void mouseDoubleClickEvent(QGraphicsSceneMouseEvent *event) override
+	{
+		event->accept();
+		edit();
+	}
+
 	void mousePressEvent(QGraphicsSceneMouseEvent *event) override
 	{
 		start = event->scenePos().x();
@@ -115,10 +158,10 @@ void EditorWindow::SetupSubtitles()
 	addToolBarBreak();
 	auto *subtitleTools = addToolBar(Text("Subtitles"));
 	subtitleTools->setMovable(false);
-	generate = subtitleTools->addAction(Text("GenerateSubtitles"), this, &EditorWindow::GenerateSubtitles);
 	addSubtitle = subtitleTools->addAction(Text("NewSubtitle"), this, [this] { EditSubtitle(true); });
 	cueActions.append(subtitleTools->addAction(Text("EditSubtitle"), this, [this] { EditSubtitle(false); }));
 	cueActions.append(subtitleTools->addAction(Text("EditWord"), this, &EditorWindow::EditSubtitleWord));
+	cueActions.append(subtitleTools->addAction(Text("SubtitleStyle"), this, &EditorWindow::EditSubtitleStyle));
 	auto *more = new QMenu(Text("SubtitleActions"), this);
 	auto *menuButton = new QPushButton(Text("SubtitleActions"), subtitleTools);
 	menuButton->setMenu(more);
@@ -134,7 +177,8 @@ void EditorWindow::SetupSubtitles()
 	}));
 	more->addAction(subtitleUndo->createUndoAction(more, Text("SubtitleUndo")));
 	more->addAction(subtitleUndo->createRedoAction(more, Text("SubtitleRedo")));
-	more->addAction(Text("ExportSrt"), this, &EditorWindow::ExportSubtitles);
+	more->addAction(Text("ExportSubtitleFile"), this, &EditorWindow::ExportSubtitles);
+	more->addAction(Text("ExportCaptionVideo"), this, &EditorWindow::ExportCaptionVideo);
 	showSubtitles = more->addAction(Text("ShowSubtitles"));
 	showSubtitles->setCheckable(true);
 	showSubtitles->setChecked(true);
@@ -177,6 +221,11 @@ void EditorWindow::AddSubtitleBlocks(double scale, int gutter)
 						double(std::numeric_limits<int>::min()), double(std::numeric_limits<int>::max()));
 					DragSubtitle(static_cast<int>(i), static_cast<int>(j), mode, qRound(milliseconds));
 				});
+			}, [this, i, j] {
+				QTimer::singleShot(0, this, [this, i, j] {
+					if (selectedClip == i && selectedCue == j)
+						EditSubtitle(false);
+				});
 			});
 			timeline->addItem(block);
 			block->setRect(0, 0, std::max(2.0, (end - start) * scale), 32);
@@ -198,13 +247,28 @@ void EditorWindow::AddSubtitleBlocks(double scale, int gutter)
 void EditorWindow::UpdateSubtitlePreview(int sourceMs)
 {
 	playheadSource = sourceMs;
-	QStringList lines;
+	QVector<VideoEditor::Caption> captions;
 	if (selectedClip >= 0) {
 		const auto &clip = project.Clips()[selectedClip];
 		if (showSubtitles->isChecked() && sourceMs >= clip.inMs && sourceMs < clip.outMs) {
-			for (const auto &cue : clip.subtitles) {
-				if (cue.inMs <= sourceMs && sourceMs < cue.outMs)
-					lines.append(cue.text);
+			const int position = clip.startMs + (sourceMs - clip.inMs);
+			for (qsizetype i = 0; i < project.Clips().size(); ++i) {
+				const auto &segment = project.Clips()[i];
+				if (position < segment.startMs || position >= segment.End())
+					continue;
+				const int time = segment.inMs + (position - segment.startMs);
+				for (qsizetype j = 0; j < segment.subtitles.size(); ++j) {
+					const auto &cue = segment.subtitles[j];
+					if (time < cue.inMs || time >= cue.outMs)
+						continue;
+					auto caption = CaptionAt(cue, time, std::max(cue.inMs, segment.inMs),
+								 std::min(cue.outMs, segment.outMs));
+					if (i == selectedClip && j == selectedCue && !preview->Playing()) {
+						caption.opacity = 100;
+						caption.offset = 0;
+					}
+					captions.append(std::move(caption));
+				}
 			}
 		}
 		if (playhead) {
@@ -213,7 +277,7 @@ void EditorWindow::UpdateSubtitlePreview(int sourceMs)
 			playhead->setLine(x, 20, x, showSubtitles->isChecked() ? 150 : 105);
 		}
 	}
-	preview->SetSubtitle(lines.join(u'\n'));
+	preview->SetSubtitles(captions);
 }
 
 void EditorWindow::ChangeSubtitles(int clip, QVector<Subtitle> subtitles, int selection)
@@ -428,6 +492,176 @@ void EditorWindow::EditSubtitleWord()
 	ChangeSubtitles(target, std::move(cues), row);
 }
 
+
+void EditorWindow::EditSubtitleStyle()
+{
+	const int target = selectedClip;
+	const int row = selectedCue;
+	const auto cue = project.Clips()[target].subtitles[row];
+	QDialog dialog(this);
+	dialog.setWindowTitle(Text("SubtitleStyle"));
+	auto *layout = new QVBoxLayout(&dialog);
+	auto *scroll = new QScrollArea(&dialog);
+	auto *panel = new QWidget(scroll);
+	QFormLayout form(panel);
+	scroll->setWidget(panel);
+	scroll->setWidgetResizable(true);
+	layout->addWidget(scroll);
+	QComboBox presets(&dialog);
+	presets.addItems({Text("SubtitleMovie"), Text("SubtitleDynamic"), Text("SubtitleShort"), Text("SubtitleMinimal")});
+	form.addRow(Text("SubtitlePreset"), &presets);
+	QFontComboBox font(&dialog);
+	form.addRow(Text("SubtitleFont"), &font);
+	QMap<QString, QSpinBox *> numbers;
+	const auto number = [&](const char *label, const QString &key, int minimum, int maximum, int initial) {
+		auto *spin = new QSpinBox(&dialog);
+		spin->setRange(minimum, maximum);
+		spin->setValue(initial);
+		numbers.insert(key, spin);
+		spin->setProperty("initial", initial);
+		form.addRow(Text(label), spin);
+	};
+	number("SubtitleSize", u"size"_s, 8, 100, 23);
+	number("SubtitleOutline", u"outline"_s, 0, 10, 0);
+	number("SubtitleShadow", u"shadow"_s, 0, 10, 0);
+	number("SubtitleBackground", u"background"_s, 0, 255, 180);
+	number("SubtitleSpacing", u"spacing"_s, -5, 20, 0);
+	number("SubtitleX", u"x"_s, 0, 100, 50);
+	number("SubtitleY", u"y"_s, 0, 100, 90);
+	number("SubtitleFadeIn", u"fadeIn"_s, 0, 5000, 0);
+	number("SubtitleFadeOut", u"fadeOut"_s, 0, 5000, 0);
+	QMap<QString, QCheckBox *> checks;
+	const auto check = [&](const char *label, const QString &key) {
+		auto *box = new QCheckBox(Text(label), &dialog);
+		checks.insert(key, box);
+		form.addRow(box);
+	};
+	check("SubtitleBold", u"bold"_s);
+	check("SubtitleItalic", u"italic"_s);
+	check("SubtitleHighlight", u"highlight"_s);
+	check("SubtitleSlide", u"slide"_s);
+	QComboBox alignment(&dialog);
+	alignment.addItems({Text("SubtitleLeft"), Text("SubtitleCenter"), Text("SubtitleRight")});
+	form.addRow(Text("SubtitleAlignment"), &alignment);
+	QComboBox position(&dialog);
+	position.addItems({Text("SubtitleTop"), Text("SubtitleCenter"), Text("SubtitleBottom"), Text("SubtitleCustom")});
+	form.addRow(Text("SubtitlePosition"), &position);
+	QPushButton foreground(&dialog);
+	QPushButton highlight(&dialog);
+	form.addRow(Text("SubtitleColor"), &foreground);
+	form.addRow(Text("SubtitleHighlightColor"), &highlight);
+	QCheckBox all(Text("SubtitleApplyClip"), &dialog);
+	form.addRow(&all);
+	BPtr<char> presetPath = GetAppConfigPathPtr("obs-studio/editor-subtitle-styles.ini");
+	QSettings settings(QString::fromUtf8(presetPath.Get()), QSettings::IniFormat);
+	settings.beginGroup(u"SubtitleStyles"_s);
+	QComboBox saved(&dialog);
+	saved.addItems(settings.childKeys());
+	QPushButton saveStyle(Text("SubtitleSaveStyle"), &dialog);
+	form.addRow(&saved, &saveStyle);
+	const auto setColor = [](QPushButton &button, const QColor &color) {
+		button.setText(color.name());
+	};
+	const auto style = [&] {
+		QJsonObject value{{"font"_L1, font.currentFont().family()}, {"align"_L1, alignment.currentIndex()},
+				  {"position"_L1, position.currentIndex()}, {"color"_L1, foreground.text()},
+				  {"highlightColor"_L1, highlight.text()}};
+		for (auto it = numbers.cbegin(); it != numbers.cend(); ++it)
+			value.insert(it.key(), it.value()->value());
+		for (auto it = checks.cbegin(); it != checks.cend(); ++it)
+			value.insert(it.key(), it.value()->isChecked());
+		return value;
+	};
+	const auto refresh = [&] {
+		auto sample = cue;
+		sample.style = style();
+		auto caption = CaptionAt(sample, sample.inMs + (sample.outMs - sample.inMs) / 2, sample.inMs, sample.outMs);
+		caption.opacity = 100;
+		caption.offset = 0;
+		if (sample.style["highlight"_L1].toBool() && !sample.words.isEmpty() && caption.word < 0)
+			caption.word = 0;
+		preview->SetSubtitles({caption});
+	};
+	const auto load = [&](const QJsonObject &value) {
+		font.setCurrentFont(QFont(value["font"_L1].toString()));
+		for (auto it = numbers.cbegin(); it != numbers.cend(); ++it)
+			it.value()->setValue(value[it.key()].toInt(it.value()->property("initial").toInt()));
+		for (auto it = checks.cbegin(); it != checks.cend(); ++it)
+			it.value()->setChecked(value[it.key()].toBool(it.key() == "bold"_L1));
+		alignment.setCurrentIndex(std::clamp(value["align"_L1].toInt(1), 0, 2));
+		position.setCurrentIndex(std::clamp(value["position"_L1].toInt(2), 0, 3));
+		setColor(foreground, QColor(value["color"_L1].toString(u"#ffffff"_s)));
+		setColor(highlight, QColor(value["highlightColor"_L1].toString(u"#ffe34d"_s)));
+		refresh();
+	};
+	const QVector<QJsonObject> styles{
+		{{"size"_L1, 23}, {"outline"_L1, 2}, {"shadow"_L1, 1}, {"background"_L1, 0}},
+		{{"size"_L1, 29}, {"outline"_L1, 3}, {"highlight"_L1, true}, {"background"_L1, 0}},
+		{{"size"_L1, 39}, {"color"_L1, "#65eaff"_L1}, {"outline"_L1, 4}, {"highlight"_L1, true},
+		 {"background"_L1, 0}, {"fadeIn"_L1, 160}, {"fadeOut"_L1, 160}, {"slide"_L1, true}},
+		{{"size"_L1, 18}, {"bold"_L1, false}, {"background"_L1, 95}},
+	};
+	connect(&presets, &QComboBox::activated, &dialog, [&](int index) { load(styles[index]); });
+	connect(&saved, &QComboBox::activated, &dialog, [&](int index) {
+		load(QJsonDocument::fromJson(settings.value(saved.itemText(index)).toByteArray()).object());
+	});
+	connect(&saveStyle, &QPushButton::clicked, &dialog, [&] {
+		bool ok;
+		const auto name = QInputDialog::getText(&dialog, Text("SubtitleSaveStyle"), Text("SubtitlePreset"),
+						      QLineEdit::Normal, {}, &ok).trimmed();
+		if (!ok || name.isEmpty() || name.contains(u'/') || name.contains(u'\\'))
+			return;
+		settings.setValue(name, QJsonDocument(style()).toJson(QJsonDocument::Compact));
+		settings.sync();
+		if (settings.status() != QSettings::NoError) {
+			QMessageBox::warning(&dialog, Text("SubtitleSaveStyle"), Text("SubtitleStyleSaveFailed"));
+			return;
+		}
+		if (saved.findText(name) < 0)
+			saved.addItem(name);
+		saved.setCurrentText(name);
+	});
+	for (auto *spin : numbers)
+		connect(spin, &QSpinBox::valueChanged, &dialog, refresh);
+	for (auto *box : checks)
+		connect(box, &QCheckBox::toggled, &dialog, refresh);
+	for (auto *combo : {&alignment, &position})
+		connect(combo, &QComboBox::currentIndexChanged, &dialog, refresh);
+	connect(&font, &QFontComboBox::currentFontChanged, &dialog, refresh);
+	for (auto *button : {&foreground, &highlight}) {
+		connect(button, &QPushButton::clicked, &dialog, [&, button] {
+			const QColor picked = QColorDialog::getColor(QColor(button->text()), &dialog);
+			if (picked.isValid()) {
+				setColor(*button, picked);
+				refresh();
+			}
+		});
+	}
+	QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+	layout->addWidget(&buttons);
+	connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+	connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+	preview->Pause();
+	previewTimer->stop();
+	play->setText(Text("Play"));
+	load(cue.style);
+	dialog.resize(std::max(440, form.sizeHint().width() + 55), std::min(650, height()));
+	dialog.move(mapToGlobal(QPoint(std::max(0, width() - dialog.width()), 0)));
+	if (dialog.exec() == QDialog::Accepted) {
+		auto cues = project.Clips()[target].subtitles;
+		const auto value = style();
+		if (all.isChecked()) {
+			for (auto &item : cues)
+				item.style = value;
+		} else {
+			cues[row].style = value;
+		}
+		ChangeSubtitles(target, std::move(cues), row);
+	} else {
+		UpdateSubtitlePreview(playheadSource);
+	}
+}
+
 void EditorWindow::SplitSubtitle()
 {
 	const int target = selectedClip;
@@ -441,7 +675,8 @@ void EditorWindow::SplitSubtitle()
 		return;
 	}
 	int suggested = static_cast<int>(words.size() / 2);
-	if (left.words.size() == words.size())
+	if (left.words.size() == words.size() &&
+	    std::all_of(left.words.begin(), left.words.end(), [](const auto &word) { return word.Known(); }))
 		suggested = static_cast<int>(std::count_if(left.words.begin(), left.words.end(),
 							  [time](const auto &word) { return word.inMs < time; }));
 	bool ok;
@@ -505,9 +740,18 @@ void EditorWindow::PasteSubtitle()
 	auto cues = clip.subtitles;
 	auto cue = copiedCue;
 	const int position = clip.inMs + seek->value();
+	const int previousStart = cue.inMs;
 	cue.outMs = position + std::min(cue.outMs - cue.inMs, clip.outMs - position);
 	cue.inMs = position;
-	cue.words.clear();
+	for (auto &word : cue.words) {
+		if (!word.Known())
+			continue;
+		const int duration = cue.outMs - cue.inMs;
+		word.inMs = position + std::clamp(word.inMs - previousStart, 0, duration);
+		word.outMs = position + std::clamp(word.outMs - previousStart, 0, duration);
+		if (!word.Known())
+			word = {0, 0};
+	}
 	cues.append(std::move(cue));
 	const int row = static_cast<int>(cues.size()) - 1;
 	ChangeSubtitles(selectedClip, std::move(cues), row);
@@ -533,6 +777,8 @@ void EditorWindow::DragSubtitle(int clipIndex, int index, int mode, int delta)
 		cue.inMs += delta;
 		cue.outMs += delta;
 		for (auto &word : cue.words) {
+			if (!word.Known())
+				continue;
 			const int assetEnd = project.Assets()[clip.asset].durationMs;
 			const int shift = std::clamp(delta, -word.inMs, assetEnd - word.outMs);
 			word.inMs += shift;
@@ -544,11 +790,112 @@ void EditorWindow::DragSubtitle(int clipIndex, int index, int mode, int delta)
 
 void EditorWindow::ExportSubtitles()
 {
-	QString path = QFileDialog::getSaveFileName(this, Text("ExportSrt"), {}, u"SubRip (*.srt)"_s);
+	const QStringList filters{u"SubRip (*.srt)"_s, u"WebVTT (*.vtt)"_s, u"Advanced SubStation Alpha (*.ass)"_s};
+	const QStringList formats{u".srt"_s, u".vtt"_s, u".ass"_s};
+	QString filter = filters.first();
+	QString path = QFileDialog::getSaveFileName(this, Text("ExportSubtitleFile"), {}, filters.join(u";;"_s), &filter);
 	if (path.isEmpty())
 		return;
-	if (!path.endsWith(u".srt"_s, Qt::CaseInsensitive))
-		path += u".srt"_s;
-	if (!project.ExportSrt(path))
+	if (std::none_of(formats.begin(), formats.end(), [&](const auto &suffix) {
+		    return path.endsWith(suffix, Qt::CaseInsensitive);
+	    }))
+		path += formats[std::max<qsizetype>(0, filters.indexOf(filter))];
+	if (!project.ExportSubtitles(path))
 		QMessageBox::warning(this, Text("Subtitles"), Text("SubtitleExportFailed"));
+}
+
+void EditorWindow::ExportCaptionVideo()
+{
+	const QStringList choices{Text("CaptionBurnIn"), Text("CaptionSelectable")};
+	bool accepted;
+	const auto choice = QInputDialog::getItem(this, Text("ExportCaptionVideo"), Text("CaptionChooseMode"),
+						  choices, 0, false, &accepted);
+	if (!accepted)
+		return;
+	const bool burnIn = choice == choices.first();
+	QString executable = speechOptions.ffmpeg;
+	if (executable.isEmpty())
+		executable = QStandardPaths::findExecutable(u"ffmpeg"_s);
+	executable = QFileDialog::getOpenFileName(this, Text(burnIn ? "CaptionFfmpegAss" : "CaptionFfmpeg"), executable);
+	if (!QFileInfo(executable).isExecutable())
+		return;
+	QString path = QFileDialog::getSaveFileName(this, Text("ExportCaptionVideo"), {}, u"Matroska (*.mkv)"_s);
+	if (path.isEmpty())
+		return;
+	if (!path.endsWith(u".mkv"_s, Qt::CaseInsensitive))
+		path += u".mkv"_s;
+	if (QFileInfo::exists(path)) {
+		QMessageBox::warning(this, Text("ExportCaptionVideo"), Text("CaptionVideoExists"));
+		return;
+	}
+	const auto fail = [this](const QString &details) {
+		QMessageBox message(QMessageBox::Warning, Text("ExportCaptionVideo"), {}, QMessageBox::Ok, this);
+		message.setTextFormat(Qt::PlainText);
+		message.setText(Text("CaptionVideoFailed").arg(details));
+		message.exec();
+	};
+	auto staging = std::make_shared<QTemporaryDir>(QFileInfo(path).absolutePath() + u"/.obs-caption-XXXXXX"_s);
+	if (!staging->isValid()) {
+		fail(staging->errorString());
+		return;
+	}
+	QString failedMedia;
+	const auto args = project.VideoExportArguments(staging->path(), burnIn, failedMedia);
+	if (args.isEmpty()) {
+		fail(failedMedia.isEmpty() ? Text("SubtitleExportFailed") : Text("CaptionMissingMedia").arg(failedMedia));
+		return;
+	}
+	auto *progress = new QProgressDialog(Text("CaptionRendering").arg(0), Text("SubtitleCancel"), 0, 100, this);
+	progress->setWindowTitle(Text("ExportCaptionVideo"));
+	progress->setWindowModality(Qt::WindowModal);
+	progress->setAutoClose(false);
+	progress->setAutoReset(false);
+	progress->setMinimumDuration(0);
+	progress->setValue(0);
+	auto *process = new QProcess(progress);
+	process->setWorkingDirectory(staging->path());
+	connect(progress, &QProgressDialog::canceled, process, &QProcess::kill);
+	connect(process, &QProcess::readyReadStandardOutput, progress,
+		[this, progress, process, duration = project.Duration()] {
+			while (process->canReadLine()) {
+				const auto line = process->readLine();
+				if (progress->wasCanceled() || !line.startsWith("out_time_us="))
+					continue;
+				const auto time = std::max<qint64>(0, line.mid(12).trimmed().toLongLong());
+				const int percent = static_cast<int>(std::min<qint64>(99, time / (10LL * duration)));
+				progress->setLabelText(Text("CaptionRendering").arg(percent));
+				progress->setValue(percent);
+			}
+		});
+	connect(process, &QProcess::errorOccurred, progress, [progress, process, fail](QProcess::ProcessError error) {
+		if (error == QProcess::FailedToStart) {
+			progress->close();
+			progress->deleteLater();
+			fail(process->errorString());
+		}
+	});
+	connect(process, &QProcess::finished, progress,
+		[this, process, progress, staging, path, fail, burnIn](int exitCode, QProcess::ExitStatus status) {
+			const bool canceled = progress->wasCanceled();
+			progress->hide();
+			progress->deleteLater();
+			if (canceled)
+				return;
+			if (exitCode || status != QProcess::NormalExit) {
+				auto details = QString::fromUtf8(process->readAllStandardError().right(1800)).trimmed();
+				if (burnIn && (details.contains(u"filter not found"_s, Qt::CaseInsensitive) ||
+					       details.contains(u"no such filter"_s, Qt::CaseInsensitive)))
+					details += u'\n' + Text("CaptionFfmpegAss");
+				fail(details);
+				return;
+			}
+			QFile output(staging->filePath(u"output.mkv"_s));
+			if (!output.rename(path)) {
+				fail(output.errorString());
+				return;
+			}
+			statusBar()->showMessage(Text("Exported").arg(QDir::toNativeSeparators(path)), 10000);
+		});
+	progress->show();
+	process->start(executable, args);
 }

@@ -2,7 +2,8 @@
 
 #include <widgets/OBSQTDisplay.hpp>
 
-#include <QImage>
+#include "SubtitleRenderer.hpp"
+
 #include <QMutex>
 
 class EditorPreview : public OBSQTDisplay {
@@ -10,14 +11,15 @@ public:
 	explicit EditorPreview(QWidget *parent);
 	~EditorPreview() override;
 
-	bool Play(const QString &path, int timeMs);
+	bool Play(const QString &path, int timeMs, bool paused = false);
 	void Pause();
 	void Clear();
 	void Seek(int timeMs);
 	int Time() const;
 	bool Playing() const;
+	bool Ended() const;
 	bool Active() const { return source != nullptr; }
-	void SetSubtitle(const QString &text);
+	void SetSubtitles(const QVector<VideoEditor::Caption> &captions);
 
 protected:
 	void showEvent(QShowEvent *event) override;
@@ -26,7 +28,7 @@ protected:
 private:
 	OBSSourceAutoRelease source;
 	QString currentPath;
-	QString subtitleText;
+	QVector<VideoEditor::Caption> subtitleCaptions;
 	QMutex subtitleMutex;
 	QImage subtitleImage;
 	qint64 renderedSubtitle = 0;
